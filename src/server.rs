@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::auth::{www_authenticate, AccessPaths, AccessPerm, EntryAccess};
+use crate::audit::{AuditEvent, AuditLogger, AuditQuery};
+use crate::auth::{get_auth_user, www_authenticate, AccessPaths, AccessPerm, EntryAccess};
 use crate::error::DufsErrorCode;
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
@@ -26,7 +27,7 @@ use hyper::{
     body::Incoming,
     header::{
         HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_DISPOSITION, CONTENT_LENGTH,
-        CONTENT_RANGE, CONTENT_TYPE, RANGE,
+        CONTENT_RANGE, CONTENT_TYPE, COOKIE, RANGE, SET_COOKIE,
     },
     Method, StatusCode, Uri,
 };
@@ -64,10 +65,14 @@ const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
+const SESSION_COOKIE_NAME: &str = "dufs_auth";
+const SESSION_COOKIE_MAX_AGE: u64 = 60 * 60 * 24 * 3; // 3 days, matches TOKEN_EXPIRATION
+const AUDIT_QUERY_PATH: &str = "__dufs__/audit";
 
 pub struct Server {
     args: Args,
     assets_prefix: String,
+    audit: Option<AuditLogger>,
     html: Cow<'static, str>,
     login_html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
@@ -104,11 +109,16 @@ impl Server {
             },
             None => Cow::Borrowed(LOGIN_HTML),
         };
+        let audit = match args.audit_log.as_ref() {
+            Some(path) => Some(AuditLogger::new(path)?),
+            None => None,
+        };
         Ok(Self {
             args,
             running,
             single_file_req_paths,
             assets_prefix,
+            audit,
             html,
             login_html,
         })
@@ -127,7 +137,7 @@ impl Server {
             http_log_data.insert("remote_addr".to_string(), addr.ip().to_string());
         }
 
-        let mut res = match self.clone().handle(req).await {
+        let mut res = match self.clone().handle(req, addr).await {
             Ok(res) => {
                 http_log_data.insert("status".to_string(), res.status().as_u16().to_string());
                 if !uri.path().starts_with(assets_prefix) {
@@ -153,8 +163,9 @@ impl Server {
         Ok(res)
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request) -> Result<Response> {
+    pub async fn handle(self: Arc<Self>, req: Request, addr: Option<SocketAddr>) -> Result<Response> {
         let mut res = Response::default();
+        let remote_ip = addr.map(|v| v.ip().to_string()).unwrap_or_else(|| "-".to_string());
 
         let req_path = req.uri().path();
         let headers = req.headers();
@@ -192,6 +203,7 @@ impl Server {
 
         let authorization = headers.get(AUTHORIZATION);
         let request_target = req.uri().to_string();
+        let session_user = self.extract_session_user(headers);
 
         let query = req.uri().query().unwrap_or_default();
         let mut query_params: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
@@ -207,6 +219,7 @@ impl Server {
                 &request_target,
                 authorization,
                 query_params.get("token"),
+                session_user.as_deref(),
                 is_microsoft_webdav,
                 &self.args.serve_path,
             )
@@ -223,6 +236,19 @@ impl Server {
                 if wants_html {
                     self.handle_login_page(method == Method::HEAD, &mut res)?;
                 } else {
+                    // Failed logins are rejected here by the auth guard,
+                    // before reaching the CHECKAUTH branch below.
+                    if method.as_str() == "CHECKAUTH" {
+                        if let Some(attempted_user) = authorization.and_then(get_auth_user) {
+                            self.audit_record(
+                                Some(&attempted_user),
+                                &remote_ip,
+                                "登录",
+                                "/".to_string(),
+                                401,
+                            );
+                        }
+                    }
                     self.auth_reject(&mut res, stale)?;
                 }
                 return Ok(res);
@@ -250,10 +276,32 @@ impl Server {
         if method.as_str() == "CHECKAUTH" {
             match user.clone() {
                 Some(user) => {
+                    if let Ok(token) = self.args.auth.generate_session_token(&user) {
+                        res.headers_mut().insert(
+                            SET_COOKIE,
+                            HeaderValue::from_str(&self.session_cookie(&token)).map_err(
+                                |_| anyhow!("Invalid session cookie value"),
+                            )?,
+                        );
+                    }
+                    // Only an explicit credential check counts as a login;
+                    // session-cookie probes (page loads) are not recorded.
+                    if authorization.is_some() {
+                        self.audit_record(Some(&user), &remote_ip, "登录", "/".to_string(), 200);
+                    }
                     *res.body_mut() = body_full(user);
                 }
                 None => {
                     if has_query_flag(&query_params, "login") || !access_paths.perm().readwrite() {
+                        if let Some(attempted_user) = authorization.and_then(get_auth_user) {
+                            self.audit_record(
+                                Some(&attempted_user),
+                                &remote_ip,
+                                "登录",
+                                "/".to_string(),
+                                401,
+                            );
+                        }
                         self.auth_reject(&mut res, false)?
                     } else {
                         *res.body_mut() = body_full("");
@@ -262,7 +310,45 @@ impl Server {
             }
             return Ok(res);
         } else if method.as_str() == "LOGOUT" {
+            self.audit_record(
+                user.as_deref(),
+                &remote_ip,
+                "退出登录",
+                "/".to_string(),
+                200,
+            );
+            res.headers_mut().insert(
+                SET_COOKIE,
+                HeaderValue::from_str(&self.session_cookie_with_max_age("", 0))
+                    .map_err(|_| anyhow!("Invalid session cookie value"))?,
+            );
             self.auth_reject(&mut res, false)?;
+            return Ok(res);
+        }
+
+        if relative_path == AUDIT_QUERY_PATH {
+            if method != Method::GET {
+                DufsErrorCode::MethodNotAllowed.respond(&mut res);
+                return Ok(res);
+            }
+            if !access_paths.perm().readwrite() {
+                DufsErrorCode::Forbidden.respond(&mut res);
+                return Ok(res);
+            }
+            match &self.audit {
+                None => status_not_found(&mut res),
+                Some(audit) => {
+                    let q = AuditQuery::from_params(&query_params);
+                    let (total, events) = audit.query(&q);
+                    let body = serde_json::to_string(&serde_json::json!({
+                        "total": total,
+                        "events": events,
+                    }))?;
+                    res.headers_mut()
+                        .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+                    *res.body_mut() = body_full(body);
+                }
+            }
             return Ok(res);
         }
 
@@ -322,6 +408,22 @@ impl Server {
                 .await?;
             return Ok(res);
         }
+
+        // Snapshot audit context before the dispatch below moves `user`/`req`.
+        let audit_user = user.clone();
+        let audit_dest = match method.as_str() {
+            "MOVE" | "COPY" => headers
+                .get("Destination")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| {
+                    let after_authority = v.split("://").nth(1).unwrap_or(v);
+                    let path_start = after_authority.find('/').unwrap_or(0);
+                    decode_uri(&after_authority[path_start..])
+                        .map(|p| p.into_owned())
+                        .unwrap_or_else(|| after_authority[path_start..].to_string())
+                }),
+            _ => None,
+        };
 
         match method {
             Method::GET | Method::HEAD => {
@@ -506,7 +608,7 @@ impl Server {
                     status_not_found(&mut res);
                 }
             }
-            method => match method.as_str() {
+            ref method => match method.as_str() {
                 "PROPFIND" => {
                     if is_dir {
                         let access_paths =
@@ -581,6 +683,41 @@ impl Server {
                     DufsErrorCode::MethodNotAllowed.respond(&mut res);
                 }
             },
+        }
+
+        if let Some(op) = match method.as_str() {
+            "GET" => {
+                if has_query_flag(&query_params, "zip") {
+                    Some("打包下载")
+                } else if is_file
+                    && !has_query_flag(&query_params, "json")
+                    && !has_query_flag(&query_params, "edit")
+                    && !has_query_flag(&query_params, "view")
+                    && !has_query_flag(&query_params, "hash")
+                {
+                    Some("下载")
+                } else {
+                    None
+                }
+            }
+            "PUT" | "PATCH" => Some("上传"),
+            "DELETE" => Some("删除"),
+            "MKCOL" => Some("新建目录"),
+            "MOVE" => Some("移动"),
+            "COPY" => Some("复制"),
+            _ => None,
+        } {
+            let audit_path = match &audit_dest {
+                Some(dest) => format!("/{relative_path} -> {dest}"),
+                None => format!("/{relative_path}"),
+            };
+            self.audit_record(
+                audit_user.as_deref(),
+                &remote_ip,
+                op,
+                audit_path,
+                res.status().as_u16(),
+            );
         }
         Ok(res)
     }
@@ -1549,6 +1686,40 @@ impl Server {
         Ok(())
     }
 
+    /// Extracts and verifies the session cookie, returning the authenticated
+    /// user name when a valid session is present.
+    fn extract_session_user(&self, headers: &HeaderMap<HeaderValue>) -> Option<String> {
+        let cookie = headers.get(COOKIE)?.to_str().ok()?;
+        for pair in cookie.split(';') {
+            let pair = pair.trim();
+            if let Some(value) = pair.strip_prefix(SESSION_COOKIE_NAME) {
+                if let Some(value) = value.strip_prefix('=') {
+                    if let Some(user) = self.args.auth.verify_session_token(value) {
+                        return Some(user);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn session_cookie(&self, token: &str) -> String {
+        self.session_cookie_with_max_age(token, SESSION_COOKIE_MAX_AGE)
+    }
+
+    fn session_cookie_with_max_age(&self, token: &str, max_age: u64) -> String {
+        format!(
+            "{}={}; Path={}; HttpOnly; SameSite=Lax; Max-Age={}",
+            SESSION_COOKIE_NAME, token, self.args.uri_prefix, max_age
+        )
+    }
+
+    fn audit_record(&self, user: Option<&str>, ip: &str, op: &str, path: String, status: u16) {
+        if let Some(audit) = &self.audit {
+            audit.record(&AuditEvent::new(user, ip, op, path, status));
+        }
+    }
+
     fn handle_login_page(&self, head_only: bool, res: &mut Response) -> Result<()> {
         let output = self.render_html(&self.login_html);
         // Return 401 without the WWW-Authenticate header so browsers render
@@ -1608,6 +1779,7 @@ impl Server {
 
         let authorization = headers.get(AUTHORIZATION);
         let request_target = req.uri().to_string();
+        let session_user = self.extract_session_user(headers);
         let guard = self
             .args
             .auth
@@ -1617,6 +1789,7 @@ impl Server {
                 &request_target,
                 authorization,
                 None,
+                session_user.as_deref(),
                 false,
                 &self.args.serve_path,
             )

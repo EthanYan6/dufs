@@ -215,6 +215,15 @@ pub fn build_cli() -> Command {
                 .help("Specify the file to save logs to, other than stdout/stderr"),
         )
         .arg(
+            Arg::new("audit-log")
+                .env("DUFS_AUDIT_LOG")
+                .hide_env(true)
+                .long("audit-log")
+                .value_name("file")
+                .value_parser(value_parser!(PathBuf))
+                .help("Enable audit logging (login, upload, download, delete, etc.) to the specified file"),
+        )
+        .arg(
             Arg::new("compress")
                 .env("DUFS_COMPRESS")
                 .hide_env(true)
@@ -300,6 +309,7 @@ pub struct Args {
     #[serde(rename = "log-format")]
     pub http_logger: HttpLogger,
     pub log_file: Option<PathBuf>,
+    pub audit_log: Option<PathBuf>,
     pub compress: Compress,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
@@ -424,6 +434,10 @@ impl Args {
 
         if let Some(log_file) = matches.get_one::<PathBuf>("log-file") {
             args.log_file = Some(log_file.clone());
+        }
+
+        if let Some(audit_log) = matches.get_one::<PathBuf>("audit-log") {
+            args.audit_log = Some(audit_log.clone());
         }
 
         if let Some(compress) = matches.get_one::<Compress>("compress") {

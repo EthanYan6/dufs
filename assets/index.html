@@ -54,6 +54,13 @@
         </svg>
         <span class="user-name"></span>
       </div>
+      <div class="audit-log-btn hidden" title="操作日志" role="button" tabindex="0">
+        <svg width="16" height="16" viewBox="0 0 16 16">
+          <path d="M5 4a.5.5 0 0 0 0 1h6a.5.5 0 0 0 0-1H5zm-.5 2.5A.5.5 0 0 1 5 6h6a.5.5 0 0 1 0 1H5a.5.5 0 0 1-.5-.5zM5 8a.5.5 0 0 0 0 1h6a.5.5 0 0 0 0-1H5zm0 2a.5.5 0 0 0 0 1h3a.5.5 0 0 0 0-1H5z"/>
+          <path fill-rule="evenodd" d="M2 2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2zm10-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1z"/>
+        </svg>
+        <span>日志</span>
+      </div>
       <div class="save-btn hidden" title="保存文件">
         <svg viewBox="0 0 1024 1024" width="24" height="24">
           <path
@@ -147,6 +154,54 @@
     </div>
   </div>
   <footer class="footer">© 2026 北京博奥瑞科技有限公司 · 文件管理系统</footer>
+  <div class="audit-modal-mask hidden">
+    <div class="audit-modal">
+      <div class="audit-modal-header">
+        <span class="audit-modal-title">操作日志</span>
+        <span class="audit-modal-close" title="关闭" role="button" tabindex="0">&times;</span>
+      </div>
+      <div class="audit-filters">
+        <input type="text" class="audit-filter-user" placeholder="账户" maxlength="64">
+        <input type="text" class="audit-filter-ip" placeholder="IP" maxlength="64">
+        <select class="audit-filter-op">
+          <option value="">全部操作</option>
+          <option>登录</option>
+          <option>退出登录</option>
+          <option>上传</option>
+          <option>下载</option>
+          <option>打包下载</option>
+          <option>删除</option>
+          <option>新建目录</option>
+          <option>移动</option>
+          <option>复制</option>
+        </select>
+        <input type="datetime-local" class="audit-filter-from" title="开始时间">
+        <input type="datetime-local" class="audit-filter-to" title="结束时间">
+        <input type="text" class="audit-filter-keyword" placeholder="路径关键词" maxlength="128">
+        <div class="audit-filter-btn" role="button" tabindex="0">查询</div>
+      </div>
+      <div class="audit-table-wrap">
+        <table class="audit-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>账户</th>
+              <th>IP</th>
+              <th>操作</th>
+              <th>路径</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="audit-empty hidden">暂无日志</div>
+      </div>
+      <div class="audit-modal-footer">
+        <span class="audit-total"></span>
+        <div class="audit-more-btn hidden" role="button" tabindex="0">加载更多</div>
+      </div>
+    </div>
+  </div>
   <template id="index-data">__INDEX_DATA__</template>
   <script src="__ASSETS_PREFIX__index.js"></script>
 </body>

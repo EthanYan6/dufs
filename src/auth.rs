@@ -147,6 +147,7 @@ impl AccessControl {
         request_target: &str,
         authorization: Option<&HeaderValue>,
         token: Option<&String>,
+        session_user: Option<&str>,
         guard_options: bool,
         root: &Path,
     ) -> (Option<String>, Option<AccessPaths>, bool, bool) {
@@ -199,6 +200,17 @@ impl AccessControl {
             }
 
             return (None, None, false, false);
+        }
+
+        if let Some(session_user) = session_user {
+            if let Some((_, ap)) = self.users.get(session_user) {
+                return (
+                    Some(session_user.to_string()),
+                    ap.guard(path, method, Some(root)).await,
+                    false,
+                    false,
+                );
+            }
         }
 
         if !guard_options && method == Method::OPTIONS {
@@ -262,6 +274,57 @@ impl AccessControl {
         let message = format!("{path}:{exp}");
         derive_secret_key(user, pass).verify(message.as_bytes(), &sig)?;
         Ok((user.to_string(), ap))
+    }
+
+    /// Generates a session token for cookie-based authentication. Unlike share
+    /// tokens it is not bound to a path; the signed message is namespaced with
+    /// `session:` so it can never collide with a share token of the form
+    /// `{path}:{exp}`.
+    pub fn generate_session_token(&self, user: &str) -> Result<String> {
+        let (pass, _) = self
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
+        let exp = (unix_now().as_millis() as u64).saturating_add(TOKEN_EXPIRATION);
+        let message = format!("session:{user}:{exp}");
+        let signing_key = derive_secret_key(user, pass);
+        let sig = signing_key.sign(message.as_bytes()).to_bytes();
+
+        let mut raw = Vec::with_capacity(64 + 8 + user.len());
+        raw.extend_from_slice(&sig);
+        raw.extend_from_slice(&exp.to_be_bytes());
+        raw.extend_from_slice(user.as_bytes());
+
+        Ok(hex::encode(raw))
+    }
+
+    /// Verifies a session token, returning the authenticated user name.
+    pub fn verify_session_token(&self, token: &str) -> Option<String> {
+        let raw = hex::decode(token).ok()?;
+
+        if raw.len() < 72 {
+            return None;
+        }
+
+        let sig_bytes = &raw[..64];
+        let exp_bytes = &raw[64..72];
+        let user_bytes = &raw[72..];
+
+        let exp = u64::from_be_bytes(exp_bytes.try_into().ok()?);
+        if unix_now().as_millis() as u64 > exp {
+            return None;
+        }
+
+        let user = std::str::from_utf8(user_bytes).ok()?;
+        let (pass, _) = self.users.get(user)?;
+
+        let sig = Signature::from_bytes(&<[u8; 64]>::try_from(sig_bytes).ok()?);
+
+        let message = format!("session:{user}:{exp}");
+        derive_secret_key(user, pass)
+            .verify(message.as_bytes(), &sig)
+            .ok()?;
+        Some(user.to_string())
     }
 }
 

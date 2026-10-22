@@ -108,6 +108,10 @@ let $logoutBtn;
  * @type Element
  */
 let $userName;
+/**
+ * @type Element
+ */
+let $auditLogBtn;
 
 // manage unload event to prevent leaving with uploads in progress
 const beforeUnloadHandler = (event) => {
@@ -149,6 +153,7 @@ async function ready() {
   $loginBtn = document.querySelector(".login-btn");
   $logoutBtn = document.querySelector(".logout-btn");
   $userName = document.querySelector(".user-name");
+  $auditLogBtn = document.querySelector(".audit-log-btn");
 
   window.addEventListener('beforeunload', beforeUnloadHandler);
 
@@ -671,6 +676,7 @@ async function setupAuth() {
     $logoutBtn.classList.remove("hidden");
     $logoutBtn.addEventListener("click", logout);
     $userName.textContent = DATA.user;
+    setupAuditLog();
   } else {
     $loginBtn.classList.remove("hidden");
     $loginBtn.addEventListener("click", () => {
@@ -678,6 +684,105 @@ async function setupAuth() {
       url.searchParams.set("login", "");
       location.href = url.toString();
     });
+  }
+}
+
+// ========== 操作日志（只读） ==========
+const AUDIT_PAGE_SIZE = 100;
+const auditState = { offset: 0, loading: false };
+
+function auditApiUrl() {
+  return new URL(DATA.uri_prefix + "__dufs__/audit", location.origin);
+}
+
+// 探测审计接口是否可用（需服务端启用 --audit-log 且当前用户有读写权限），可用才显示入口
+async function setupAuditLog() {
+  if (!$auditLogBtn) return;
+  try {
+    const probe = auditApiUrl();
+    probe.searchParams.set("limit", "1");
+    const res = await fetch(probe);
+    if (!res.ok) return;
+  } catch (err) {
+    return;
+  }
+  $auditLogBtn.classList.remove("hidden");
+  onActivate($auditLogBtn, openAuditModal);
+  onActivate(document.querySelector(".audit-modal-close"), closeAuditModal);
+  document.querySelector(".audit-modal-mask").addEventListener("click", e => {
+    if (e.target.classList.contains("audit-modal-mask")) closeAuditModal();
+  });
+  onActivate(document.querySelector(".audit-filter-btn"), () => loadAuditEvents(true));
+  onActivate(document.querySelector(".audit-more-btn"), () => loadAuditEvents(false));
+  document.querySelector(".audit-filters").addEventListener("keydown", e => {
+    if (e.key === "Enter") loadAuditEvents(true);
+  });
+}
+
+// 绑定点击与键盘激活（Enter/Space），配合 role="button" 使用
+function onActivate(el, fn) {
+  el.addEventListener("click", fn);
+  el.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      fn();
+    }
+  });
+}
+
+function openAuditModal() {
+  document.querySelector(".audit-modal-mask").classList.remove("hidden");
+  loadAuditEvents(true);
+}
+
+function closeAuditModal() {
+  document.querySelector(".audit-modal-mask").classList.add("hidden");
+}
+
+async function loadAuditEvents(reset) {
+  if (auditState.loading) return;
+  auditState.loading = true;
+  if (reset) auditState.offset = 0;
+  const url = auditApiUrl();
+  const filters = {
+    user: ".audit-filter-user",
+    ip: ".audit-filter-ip",
+    op: ".audit-filter-op",
+    from: ".audit-filter-from",
+    to: ".audit-filter-to",
+    keyword: ".audit-filter-keyword",
+  };
+  for (const [key, selector] of Object.entries(filters)) {
+    const value = document.querySelector(selector).value.trim();
+    if (value) url.searchParams.set(key, value);
+  }
+  url.searchParams.set("offset", String(auditState.offset));
+  url.searchParams.set("limit", String(AUDIT_PAGE_SIZE));
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`查询失败 (${res.status})`);
+    const data = await res.json();
+    renderAuditEvents(data.events, !reset);
+    auditState.offset += data.events.length;
+    document.querySelector(".audit-total").textContent = `共 ${data.total} 条`;
+    document.querySelector(".audit-more-btn").classList.toggle("hidden", auditState.offset >= data.total);
+    document.querySelector(".audit-empty").classList.toggle("hidden", data.total > 0);
+  } catch (err) {
+    alert(err.message);
+  } finally {
+    auditState.loading = false;
+  }
+}
+
+function renderAuditEvents(events, append) {
+  const $tbody = document.querySelector(".audit-table tbody");
+  if (!append) $tbody.textContent = "";
+  for (const ev of events) {
+    const $tr = $tbody.insertRow();
+    for (const value of [ev.time, ev.user, ev.ip, ev.op, ev.path, ev.status]) {
+      // textContent 防止日志内容注入 HTML
+      $tr.insertCell().textContent = value === null || value === "" ? "-" : String(value);
+    }
   }
 }
 
