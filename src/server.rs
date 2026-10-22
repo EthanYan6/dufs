@@ -25,8 +25,8 @@ use hyper::body::Frame;
 use hyper::{
     body::Incoming,
     header::{
-        HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
-        CONTENT_TYPE, RANGE,
+        HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_DISPOSITION, CONTENT_LENGTH,
+        CONTENT_RANGE, CONTENT_TYPE, RANGE,
     },
     Method, StatusCode, Uri,
 };
@@ -56,6 +56,7 @@ pub type Response = hyper::Response<BoxBody<Bytes, anyhow::Error>>;
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const INDEX_CSS: &str = include_str!("../assets/index.css");
 const INDEX_JS: &str = include_str!("../assets/index.js");
+const LOGIN_HTML: &str = include_str!("../assets/login.html");
 const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
 const INDEX_NAME: &str = "index.html";
 const BUF_SIZE: usize = 65536;
@@ -68,6 +69,7 @@ pub struct Server {
     args: Args,
     assets_prefix: String,
     html: Cow<'static, str>,
+    login_html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
 }
@@ -95,12 +97,20 @@ impl Server {
             Some(path) => Cow::Owned(std::fs::read_to_string(path.join("index.html"))?),
             None => Cow::Borrowed(INDEX_HTML),
         };
+        let login_html = match args.assets.as_ref() {
+            Some(path) => match std::fs::read_to_string(path.join("login.html")) {
+                Ok(v) => Cow::Owned(v),
+                Err(_) => Cow::Borrowed(LOGIN_HTML),
+            },
+            None => Cow::Borrowed(LOGIN_HTML),
+        };
         Ok(Self {
             args,
             running,
             single_file_req_paths,
             assets_prefix,
             html,
+            login_html,
         })
     }
 
@@ -204,7 +214,17 @@ impl Server {
 
         let (user, access_paths) = match (user, access_paths) {
             (None, None) => {
-                self.auth_reject(&mut res, stale)?;
+                let wants_html = (method == Method::GET || method == Method::HEAD)
+                    && headers
+                        .get(ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.contains("text/html"))
+                        .unwrap_or(false);
+                if wants_html {
+                    self.handle_login_page(method == Method::HEAD, &mut res)?;
+                } else {
+                    self.auth_reject(&mut res, stale)?;
+                }
                 return Ok(res);
             }
             (Some(_), None) => {
@@ -213,6 +233,15 @@ impl Server {
             }
             (x, Some(y)) => (x, y),
         };
+
+        if self.args.auth.has_users()
+            && method == Method::GET
+            && user.is_none()
+            && has_query_flag(&query_params, "login")
+        {
+            self.handle_login_page(false, &mut res)?;
+            return Ok(res);
+        }
 
         if detect_noscript(&user_agent) {
             query_params.insert("noscript".to_string(), String::new());
@@ -1517,6 +1546,28 @@ impl Server {
 
         www_authenticate(res, &self.args, stale)?;
         *res.status_mut() = StatusCode::UNAUTHORIZED;
+        Ok(())
+    }
+
+    fn handle_login_page(&self, head_only: bool, res: &mut Response) -> Result<()> {
+        let output = self.render_html(&self.login_html);
+        // Return 401 without the WWW-Authenticate header so browsers render
+        // the branded login page instead of the native auth dialog.
+        *res.status_mut() = StatusCode::UNAUTHORIZED;
+        res.headers_mut()
+            .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
+        res.headers_mut()
+            .typed_insert(ContentLength(output.len() as u64));
+        res.headers_mut()
+            .typed_insert(CacheControl::new().with_no_cache());
+        res.headers_mut().insert(
+            "x-content-type-options",
+            HeaderValue::from_static("nosniff"),
+        );
+        if head_only {
+            return Ok(());
+        }
+        *res.body_mut() = body_full(output);
         Ok(())
     }
 
