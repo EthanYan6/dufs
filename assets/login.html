@@ -225,7 +225,9 @@
     errorBox.classList.remove('show');
     btn.disabled = true;
     btn.textContent = '登录中…';
-    fetch(targetUrl().toString(), {
+    var loginUrl = targetUrl();
+    loginUrl.searchParams.set('login', '');
+    fetch(loginUrl.toString(), {
       method: 'CHECKAUTH',
       headers: { 'Authorization': 'Basic ' + encodeBase64(user + ':' + pass) }
     }).then(function (res) {

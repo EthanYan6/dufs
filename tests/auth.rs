@@ -209,6 +209,61 @@ fn auth_check2(
 }
 
 #[rstest]
+fn auth_form_session_ignores_stale_digest(
+    #[with(&["--auth", "user:pass@/:rw", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let login_url = format!("{}?login", server.url());
+    let resp = fetch!(b"CHECKAUTH", &login_url)
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    let cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("successful form login should set a session cookie")
+        .to_str()?
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // A restarted server rejects Digest nonces minted by the old process. A
+    // valid session must still authenticate the request in that situation.
+    let stale_digest = concat!(
+        "Digest username=\"user\", realm=\"DUFS\", ",
+        "nonce=\"00000000000000000000000000000000000000000000000000\", ",
+        "uri=\"/\", response=\"00\", qop=auth, nc=00000001, cnonce=\"abcdef\""
+    );
+    let resp = fetch!(b"GET", server.url())
+        .header("Accept", "text/html")
+        .header("Cookie", &cookie)
+        .header("Authorization", stale_digest)
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    Ok(())
+}
+
+#[rstest]
+fn auth_form_failure_does_not_challenge(
+    #[with(&["--auth", "user:pass@/:rw", "-A"])] server: TestServer,
+) -> Result<(), Error> {
+    let login_url = format!("{}?login", server.url());
+    let resp = fetch!(b"CHECKAUTH", &login_url)
+        .basic_auth("user", Some("wrong"))
+        .send()?;
+    assert_eq!(resp.status(), 401);
+    assert!(resp.headers().get("www-authenticate").is_none());
+
+    // Non-browser clients still receive a challenge on the original endpoint.
+    let resp = fetch!(b"CHECKAUTH", server.url())
+        .basic_auth("user", Some("wrong"))
+        .send()?;
+    assert_eq!(resp.status(), 401);
+    assert!(resp.headers().get("www-authenticate").is_some());
+    Ok(())
+}
+
+#[rstest]
 fn auth_check3(
     #[with(&["--auth", "user:pass@/:rw", "--auth", "@/dir1:rw", "-A"])] server: TestServer,
 ) -> Result<(), Error> {

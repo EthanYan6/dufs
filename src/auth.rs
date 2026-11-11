@@ -174,6 +174,7 @@ impl AccessControl {
         }
 
         if let Some(authorization) = authorization {
+            let mut stale = false;
             if let Some(user) = get_auth_user(authorization) {
                 if let Some((pass, ap)) = self.users.get(&user) {
                     match check_auth(authorization, method.as_str(), request_target, &user, pass) {
@@ -193,13 +194,30 @@ impl AccessControl {
                                 false,
                             );
                         }
-                        AuthResult::Stale => return (None, None, false, true),
+                        AuthResult::Stale => stale = true,
                         AuthResult::Invalid => {}
                     }
                 }
             }
 
-            return (None, None, false, false);
+            // Browsers can keep sending cached Digest credentials after a
+            // restart, even though the new process no longer recognizes their
+            // nonce. Fall back to a valid session for normal requests so those
+            // stale credentials do not force another login. CHECKAUTH is the
+            // explicit login path and must still validate its credentials.
+            if method.as_str() != "CHECKAUTH" {
+                if let Some(session_user) = session_user {
+                    if let Some((_, ap)) = self.users.get(session_user) {
+                        return (
+                            Some(session_user.to_string()),
+                            ap.guard(path, method, Some(root)).await,
+                            false,
+                            false,
+                        );
+                    }
+                }
+            }
+            return (None, None, false, stale);
         }
 
         if let Some(session_user) = session_user {

@@ -249,7 +249,14 @@ impl Server {
                             );
                         }
                     }
-                    self.auth_reject(&mut res, stale)?;
+                    if method.as_str() == "CHECKAUTH" && has_query_flag(&query_params, "login") {
+                        // The branded login form handles this response itself.
+                        // A challenge here would make the browser open its
+                        // native authentication dialog over the form.
+                        *res.status_mut() = StatusCode::UNAUTHORIZED;
+                    } else {
+                        self.auth_reject(&mut res, stale)?;
+                    }
                 }
                 return Ok(res);
             }
@@ -302,7 +309,11 @@ impl Server {
                                 401,
                             );
                         }
-                        self.auth_reject(&mut res, false)?
+                        if has_query_flag(&query_params, "login") {
+                            *res.status_mut() = StatusCode::UNAUTHORIZED;
+                        } else {
+                            self.auth_reject(&mut res, false)?
+                        }
                     } else {
                         *res.body_mut() = body_full("");
                     }
